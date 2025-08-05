@@ -5,30 +5,56 @@ import numpy as np
 import torch 
 from torch import nn
 from torch import optim
+import torchvision 
+import torch.nn.functional as F
+from torchvision import transforms,datasets
+import cv2
 from torch.distributions.categorical import Categorical
+
+import ale_py
+# if using gymnasium
+import shimmy
 
 sns.set()
 
 DEVICE= 'cuda'
 
+
+def preprocess_frame(frame):
+    """
+    Preprocess the frame for the model.
+    Convert to grayscale, resize, and normalize.
+    """
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    frame = cv2.resize(frame, (96, 96))
+    frame = frame / 255.0  # Normalize to [0, 1]  # Add channel dimension
+    return torch.tensor(frame, dtype=torch.float32, device=DEVICE)
 # Policy and value model
+
 class ActorCriticNetwork(nn.Module):
+
   def __init__(self, obs_space_size, action_space_size):
     super().__init__()
 
     self.shared_layers = nn.Sequential(
-        nn.Linear(obs_space_size, 64),
+        nn.Conv2d(1, 32, 4, 2),
         nn.ReLU(),
-        nn.Linear(64, 64),
+        nn.Conv2d(32,64, 3, 2),
+        nn.ReLU(),
+        nn.Conv2d(64, 64, 3, 2),
         nn.ReLU())
     
+    with torch.no_grad():
+        dummy = torch.zeros(1, 1, 96, 96)  # batch=1, grayscale, 96x96
+        conv_out = self.shared_layers(dummy)
+        flattened_size = conv_out.view(1, -1).shape[1]
     self.policy_layers = nn.Sequential(
-        nn.Linear(64, 64),
+        nn.Linear(flattened_size, 64),
         nn.ReLU(),
         nn.Linear(64, action_space_size))
     
     self.value_layers = nn.Sequential(
-        nn.Linear(64, 64),
+        nn.Linear(flattened_size, 64),
         nn.ReLU(),
         nn.Linear(64, 1))
     
@@ -136,11 +162,11 @@ def rollout(model, env, max_steps=1000):
     ### Create data storage
     train_data = [[], [], [], [], []] # obs, act, reward, values, act_log_probs
     obs,info = env.reset()
+    input_frame = preprocess_frame(obs).unsqueeze(0)
 
     ep_reward = 0
     for _ in range(max_steps):
-        logits, val = model(torch.tensor(obs, dtype=torch.float32,
-                                         device=DEVICE).unsqueeze(0))
+        logits, val = model(input_frame)
         act_distribution = Categorical(logits=logits)
         act = act_distribution.sample()
         act_log_prob = act_distribution.log_prob(act).item()
@@ -165,7 +191,7 @@ def rollout(model, env, max_steps=1000):
 
     return train_data, ep_reward
 
-env = gym.make('CartPole-v1', render_mode='human')
+env = gym.make('ALE/Pong-v5', render_mode='rgb_array')
 model = ActorCriticNetwork(env.observation_space.shape[0], env.action_space.n)
 model = model.to(DEVICE)
 train_data, reward = rollout(model, env) # Test rollout function
