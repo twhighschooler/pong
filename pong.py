@@ -26,14 +26,14 @@ def preprocess_frame(frame):
     Convert to grayscale, resize, and normalize.
     """
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-    frame = cv2.resize(frame, (96, 96))
+    frame = cv2.resize(frame, (96, 96))  # Resize to 96x96 and add channel dimension
     frame = frame / 255.0  # Normalize to [0, 1]  # Add channel dimension
     return torch.tensor(frame, dtype=torch.float32, device=DEVICE)
 # Policy and value model
 
 class ActorCriticNetwork(nn.Module):
 
-  def __init__(self, obs_space_size, action_space_size):
+  def __init__(self, action_space_size):
     super().__init__()
 
     self.shared_layers = nn.Sequential(
@@ -60,16 +60,20 @@ class ActorCriticNetwork(nn.Module):
     
   def value(self, obs):
     z = self.shared_layers(obs)
+    z = z.view(z.size(0), -1)
     value = self.value_layers(z)
     return value
         
   def policy(self, obs):
     z = self.shared_layers(obs)
+    z = z.view(z.size(0), -1)
     policy_logits = self.policy_layers(z)
     return policy_logits
 
   def forward(self, obs):
     z = self.shared_layers(obs)
+    print("Conv output shape:", z.shape)
+    z = z.view(z.size(0), -1)
     policy_logits = self.policy_layers(z)
     value = self.value_layers(z)
     return policy_logits, value
@@ -176,7 +180,7 @@ def rollout(model, env, max_steps=1000):
         next_obs, reward, terminated, truncated, _ = env.step(act)
         done = terminated or truncated
 
-        for i, item in enumerate((obs, act, reward, val, act_log_prob)):
+        for i, item in enumerate((input_frame, act, reward, val, act_log_prob)):
           train_data[i].append(item)
 
         obs = next_obs
@@ -192,7 +196,7 @@ def rollout(model, env, max_steps=1000):
     return train_data, ep_reward
 
 env = gym.make('ALE/Pong-v5', render_mode='rgb_array')
-model = ActorCriticNetwork(env.observation_space.shape[0], env.action_space.n)
+model = ActorCriticNetwork(action_space_size=env.action_space.n)
 model = model.to(DEVICE)
 train_data, reward = rollout(model, env) # Test rollout function
 
@@ -216,7 +220,7 @@ for episode_idx in range(n_episodes):
 
   # Shuffle
   permute_idxs = np.random.permutation(len(train_data[0]))
-
+  print("Obs shape:", obs.shape)
   # Policy data
   obs = torch.tensor(train_data[0][permute_idxs],
                      dtype=torch.float32, device=DEVICE)
