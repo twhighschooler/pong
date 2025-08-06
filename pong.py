@@ -28,7 +28,8 @@ def preprocess_frame(frame):
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
     frame = cv2.resize(frame, (96, 96))  # Resize to 96x96 and add channel dimension
     frame = frame / 255.0  # Normalize to [0, 1]  # Add channel dimension
-    return torch.tensor(frame, dtype=torch.float32, device=DEVICE)
+    tensor_frame =  torch.tensor(frame, dtype=torch.float32, device=DEVICE) 
+    return tensor_frame
 # Policy and value model
 
 class ActorCriticNetwork(nn.Module):
@@ -60,19 +61,20 @@ class ActorCriticNetwork(nn.Module):
     
   def value(self, obs):
     z = self.shared_layers(obs)
-    z = z.view(z.size(0), -1)
+    z = z.reshape(z.size(0), -1)
     value = self.value_layers(z)
     return value
         
   def policy(self, obs):
     z = self.shared_layers(obs)
-    z = z.view(z.size(0), -1)
+    z = z.reshape(z.size(0), -1)
     policy_logits = self.policy_layers(z)
     return policy_logits
 
   def forward(self, obs):
+    # print("Batch size:", obs.shape[0])
     z = self.shared_layers(obs)
-    print("Conv output shape:", z.shape)
+    # print("Conv output shape:", z.shape)
     z = z.view(z.size(0), -1)
     policy_logits = self.policy_layers(z)
     value = self.value_layers(z)
@@ -157,7 +159,7 @@ def calculate_gaes(rewards, values, gamma=0.99, decay=0.97):
 
     return np.array(gaes[::-1])
 
-def rollout(model, env, max_steps=1000):
+def rollout(model, env, max_steps=1024):
     """
     Performs a single rollout.
     Returns training data in the shape (n_steps, observation_shape)
@@ -166,7 +168,9 @@ def rollout(model, env, max_steps=1000):
     ### Create data storage
     train_data = [[], [], [], [], []] # obs, act, reward, values, act_log_probs
     obs,info = env.reset()
-    input_frame = preprocess_frame(obs).unsqueeze(0)
+    # print("obs shape before model:", obs.shape)
+    input_frame = preprocess_frame(obs).unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+    # print("input_frame_size: " + str(input_frame.shape))
 
     ep_reward = 0
     for _ in range(max_steps):
@@ -180,7 +184,7 @@ def rollout(model, env, max_steps=1000):
         next_obs, reward, terminated, truncated, _ = env.step(act)
         done = terminated or truncated
 
-        for i, item in enumerate((input_frame, act, reward, val, act_log_prob)):
+        for i, item in enumerate((preprocess_frame(obs), act, reward, val, act_log_prob)):
           train_data[i].append(item)
 
         obs = next_obs
@@ -188,7 +192,16 @@ def rollout(model, env, max_steps=1000):
         if done:
             break
 
-    train_data = [np.asarray(x) for x in train_data]
+    # train_data = [x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x) for x in train_data]
+    def to_cpu_numpy(x):
+      if torch.is_tensor(x):
+        return x.cpu().numpy()
+      elif isinstance(x, (list, tuple)):
+        return [to_cpu_numpy(i) for i in x]
+      else:
+        return x
+
+    train_data = to_cpu_numpy(train_data)
 
     ### Do train data filtering
     train_data[3] = calculate_gaes(train_data[2], train_data[3])
@@ -211,6 +224,8 @@ ppo = PPOTrainer(
     target_kl_div = 0.02,
     max_policy_train_iters = 40,
     value_train_iters = 40)
+
+
 # Training loop
 ep_rewards = []
 for episode_idx in range(n_episodes):
@@ -218,26 +233,49 @@ for episode_idx in range(n_episodes):
   train_data, reward = rollout(model, env)
   ep_rewards.append(reward)
 
+  train_data[0] = np.stack(train_data[0])[:, np.newaxis, :, :]  # obs: (steps, 1, 96, 96)
+  train_data[1] = np.array(train_data[1])
+  train_data[2] = np.array(train_data[2])
+  train_data[3] = np.array(train_data[3])
+  train_data[4] = np.array(train_data[4])
+
+
   # Shuffle
   permute_idxs = np.random.permutation(len(train_data[0]))
-  print("Obs shape:", obs.shape)
+  # print("Obs shape:", obs.shape)
   # Policy data
-  obs = torch.tensor(train_data[0][permute_idxs],
+  
+  obs_all = torch.tensor(train_data[0][permute_idxs],
                      dtype=torch.float32, device=DEVICE)
-  acts = torch.tensor(train_data[1][permute_idxs],
+  acts_all = torch.tensor(train_data[1][permute_idxs],
                       dtype=torch.int32, device=DEVICE)
-  gaes = torch.tensor(train_data[3][permute_idxs],
+  gaes_all = torch.tensor(train_data[3][permute_idxs],
                       dtype=torch.float32, device=DEVICE)
-  act_log_probs = torch.tensor(train_data[4][permute_idxs],
+  act_log_probs_all = torch.tensor(train_data[4][permute_idxs],
                                dtype=torch.float32, device=DEVICE)
 
   # Value data
   returns = discount_rewards(train_data[2])[permute_idxs]
-  returns = torch.tensor(returns, dtype=torch.float32, device=DEVICE)
+  returns_all = torch.tensor(returns, dtype=torch.float32, device=DEVICE)
 
-  # Train model
-  ppo.train_policy(obs, acts, act_log_probs, gaes)
-  ppo.train_value(obs, returns)
+  total_steps = len(obs_all)
+  for start in range(0, total_steps, 64):
+     end = start + 64
+
+     obs = obs_all[start:end]
+     acts = acts_all[start:end]
+     gaes = gaes_all[start:end]
+     act_log_probs = act_log_probs_all[start:end]
+     returns_mb = returns_all[start:end]
+
+       # Train model
+     ppo.train_policy(obs, acts, act_log_probs, gaes)
+     ppo.train_value(obs, returns_mb)
+  
+
+
+
+
 
   if (episode_idx + 1) % print_freq == 0:
     print('Episode {} | Avg Reward {:.1f}'.format(
