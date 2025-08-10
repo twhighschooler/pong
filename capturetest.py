@@ -1,5 +1,6 @@
 import time
 import os
+import keyboard
 from torch import nn
 import torch
 import numpy as np
@@ -16,18 +17,22 @@ fps = 25
 lr_actor = 1e-4
 lr_critic = 1e-3
 gamma = 0.99
+
 tau = 0.001
 noise_decay = 0.995
 min_noise = 0.01
-exploration_noise = 0.1
+exploration_noise = 0.2
 batch_size = 64
 buffer_size = 10000
 stop_training = False
+emergency_stop_key = 'esc'
 frame_duration = 1 / fps
 monitor = {"top": 227, "left": 560, "width": 800, "height": 600}
 frame_stack = deque(maxlen=4)  # Stack to hold the last 4 frames
 frame_stack.clear()  # Clear the stack initially
 sct = mss.mss()
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def setup_emergency_stop():
@@ -40,7 +45,8 @@ def setup_emergency_stop():
         print("interrupt by keyboard,you pressed esc")
     keyboard.add_hotkey(emergency_stop_key, on_stop_key)
 
-
+def check_stop_condition():
+    return stop_training
 def get_game_status():
     try:
 
@@ -111,7 +117,7 @@ def calculate_reward(prev_stats, current_stats):
 
     reward += new_perfects * 10
     reward += new_goods * 5  
-    reward -= new_bads * 2
+    reward += new_bads * 2
     reward -= new_misses * 10
     
     if current_stats['combo'] >50:
@@ -162,17 +168,20 @@ class ReplayBuffer:
     def __init__(self,capacity):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
-    def push(self,state , action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self,frames,mouse_pos , action, reward, next_frames,next_mouse_pos, done):
+        self.buffer.append((frames,mouse_pos, action, reward, next_frames,next_mouse_pos, done))
     def sample(self,batch_size):
         batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = zip(*batch)
-        state = torch.cat(state, dim=0)
+        frames,mouse_pos, action, reward, next_frames,next_mouse_pos, done = zip(*batch)
+
+        frames = torch.cat(frames,dim = 0)
+        mouse_pos = torch.cat(mouse_pos,dim = 0)
         action = torch.cat(action, dim=0)
         reward = torch.tensor(reward, dtype=torch.float32).unsqueeze(1).to(device)
-        next_state = torch.cat(next_state, dim=0)
+        next_frames = torch.cat(next_frames,dim=0)
+        next_mouse_pos = torch.cat(next_mouse_pos,dim=0)
         done = torch.tensor(done, dtype=torch.float32).unsqueeze(1).to(device)
-        return state, action, reward, next_state, done
+        return frames,mouse_pos, action, reward, next_frames,next_mouse_pos, done
     def __len__(self):
         return len(self.buffer)
 class Actor(nn.Module):
@@ -261,29 +270,27 @@ class DDPG:
             action = torch.clamp(action, -1, 1)
 
         return action
-    def update(self):
+    def update(self,current_stats):
         if len(self.replay_buffer) < batch_size:
             return
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch = self.replay_buffer.sample(batch_size)
-        state_frames = state_batch[:, :4, :, :]  # First 4 channels are frames
-        state_mouse = state_batch[:, 4:6, 0, 0]  # Mouse pos stored in channels 4-5
-        next_state_frames = next_state_batch[:, :4, :, :]
-        next_state_mouse = next_state_batch[:, 4:6, 0, 0]
-
-        with torch.no_grad():
-            next_actions = self.target_actor(next_state_frames, next_state_mouse)
-            next_q = self.target_critic(next_state_frames, next_state_mouse, next_actions)
-            target_q = reward_batch + (gamma * next_q * (1 - done_batch))
+        frames,mouse_pos,action,reward,next_frames,next_mouse_pos,done=self.replay_buffer.sample(batch_size)
         
-        current_q = self.critic(state_frames, state_mouse, action_batch)
+        if not current_stats['playing']:
+            return 
+        with torch.no_grad():
+            next_actions = self.target_actor(next_frames, next_mouse_pos)
+            next_q = self.target_critic(next_frames, next_mouse_pos, next_actions)
+            target_q = reward + (gamma * next_q * (1 - done))
+        
+        current_q = self.critic(frames, mouse_pos,action)
         critic_loss = F.mse_loss(current_q, target_q)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        predicted_actions = self.actor(state_frames, state_mouse)
-        actor_loss = -self.critic(state_frames, state_mouse, predicted_actions).mean()
+        predicted_actions = self.actor(frames, mouse_pos)
+        actor_loss = -self.critic(frames, mouse_pos, predicted_actions).mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -295,103 +302,129 @@ class DDPG:
         self.exploration_noise = max(min_noise, self.exploration_noise * noise_decay)
 
         return critic_loss.item(), actor_loss.item()
-def create_state_tensor(frames, mouse_pos):
-    """Combine frames and mouse position into single state tensor"""
-    # Pad mouse position to match frame dimensions and add as extra channels
-    mouse_expanded = mouse_pos.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 60, 80)
-    state = torch.cat([frames, mouse_expanded], dim=1)
-    return state
-
 
 def training_loop():
     ddpg = DDPG(action_space_size=2)
-
+    global next_frame_time
+    setup_emergency_stop()
     for _ in range(4):
         frame = capture_screen()
         frame_stack.append(frame)
     episode = 0
     
+
+
     print("Starting training ...")
-    while True:
-        episode += 1
-        
-        step = 0
-        print(f"Starting Episode {episode}")
+    try:
+        while not check_stop_condition():
+            episode += 1
+            center_x = monitor["left"] + monitor["width"] // 2
+            center_y = monitor["top"] + monitor["height"] // 2
+            pyautogui.moveTo(center_x, center_y)
+            step = 0
+            print(f"Starting Episode {episode}")
 
-        while True:
-            current_stats = get_game_status()
-            if current_stats['playing']:  # Game is active
+            while not check_stop_condition():
+                current_stats = get_game_status()
+                if current_stats['playing']:  # Game is active
+                    break
+                time.sleep(0.5)
+            print('game started!')
+            prev_stats = get_game_status()
+            state_frames = update_stack(capture_screen())
+            prev_mouse_pos = mouse_position()
+
+            while not check_stop_condition():
+                step += 1
+            
+                
+
+                action = ddpg.select_action(state_frames, prev_mouse_pos)
+
+                action_np = action.cpu().numpy().flatten()
+                penalty_threshold = 0.99
+                penalty=0
+                if any(abs(a) >= penalty_threshold for a in action_np):
+                    penalty = -100
+                # print("Action output:", action_np)
+
+
+                new_x = monitor["left"] + (action_np[0] + 1) * monitor["width"] / 2
+                new_y = monitor["top"] + (action_np[1] + 1) * monitor["height"] / 2
+
+                pyautogui.moveTo(new_x, new_y, duration=0.04)
+            
+                # below is the precise fps control  
+                next_frame_time += frame_duration
+                sleep_time = next_frame_time - time.perf_counter()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    # we're late, skip sleeping to catch up
+                    next_frame_time = time.perf_counter()
+
+                next_frame = capture_screen()
+                next_state_frames = update_stack(next_frame)
+                current_mouse_pos = mouse_position()
+                current_stats = get_game_status()
+
+                reward = calculate_reward(prev_stats, current_stats)
+                reward = reward + penalty
+                print(f"Step: {step}, Reward: {reward}")
+
+                done = current_stats['finished']
+
+                ddpg.replay_buffer.push(state_frames,prev_mouse_pos,action,reward,next_state_frames,current_mouse_pos,done)
+               
+
+                if len(ddpg.replay_buffer) >= batch_size:
+                    losses = ddpg.update(current_stats)
+                    if losses and step % 100 == 0:
+                        critic_loss, actor_loss = losses
+                        print (f"step:{step}, Critic Loss:{critic_loss},Actor_loss:{actor_loss}")
+            
+            
+                state_frames = next_state_frames
+                prev_mouse_pos = current_mouse_pos
+                prev_stats = current_stats.copy()
+
+                if done:
+                    print(f"Episode {episode} finished!")
+                    break
+            
+            if check_stop_condition():
                 break
-            time.sleep(0.5)
-        print('game started!')
-        prev_stats = get_game_status()
-        state_frames = update_stack(capture_screen())
-        prev_mouse_pos = mouse_position()
 
-        while True:
-            step += 1
-            
-            state = create_state_tensor(state_frames, prev_mouse_pos)
+            print(f"Episode: {episode},perfects:{current_stats['perfects']},goods:{current_stats['goods']},bads:{current_stats['bads']},misses:{current_stats['misses']} ,Noise: {ddpg.exploration_noise:.4f}")
 
-            action = ddpg.select_action(state_frames, prev_mouse_pos)
-
-            action_np = action.cpu().numpy().flatten()
-
-            new_x = monitor["left"] + (action_np[0] + 1) * monitor["width"] / 2
-            new_y = monitor["top"] + (action_np[1] + 1) * monitor["height"] / 2
-
-            pyautogui.moveTo(new_x, new_y, duration=0)
-            
-            # below is the precise fps control  
-            next_frame_time += frame_duration
-            sleep_time = next_frame_time - time.perf_counter()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # we're late, skip sleeping to catch up
-                next_frame_time = time.perf_counter()
-
-            next_frame = capture_screen()
-            next_state_frames = update_stack(next_frame)
-            current_mouse_pos = mouse_position()
-            current_stats = get_game_status()
-
-            reward = calculate_reward(prev_stats, current_stats)
-            done = current_stats['finished']
-
-
-            next_state = create_state_tensor(next_state_frames, current_mouse_pos)
-            ddpg.replay_buffer.push(state, action, reward, next_state, done)
-
-            if len(ddpg.replay_buffer) >= batch_size:
-                losses = ddpg.update()
-                if losses and step % 100 == 0:
-                    critic_loss, actor_loss = losses
-                    print (f"step:{step}, Critic Loss:{critic_loss},Actor_loss:{actor_loss}")
-            
-            
-            state_frames = next_state_frames
-            prev_mouse_pos = current_mouse_pos
-            prev_stats = current_stats.copy()
-
-            if done:
-                print(f"Episode {episode} finished!")
-                break
-        print(f"Episode: {episode},perfects:{current_stats['perfects']},goods:{current_stats['goods']},bads:{current_stats['bads']},misses:{current_stats['misses']} ,Noise: {ddpg.exploration_noise:.4f}")
-
-        if episode % 100 == 0:
+            if episode % 100 == 0:
+                torch.save({ 
+                    'episode': episode,
+                    'exploration_noise' : ddpg.exploration_noise,
+                    'actor_state_dict': ddpg.actor.state_dict(),
+                    'critic_state_dict': ddpg.critic.state_dict(),
+                    'actor_optimizer': ddpg.actor_optimizer.state_dict(),
+                    'critic_optimizer': ddpg.critic_optimizer.state_dict(),
+                }, f'ddpg_checkpoint_episode_{episode}.pth')
+                print(f"Saved checkpoint at episode {episode}")
+    except KeyboardInterrupt:
+        print("\n keyboard interrupt by you")
+        stop_training = True
+    finally:
+        print('stopped and saved(probably)')
+        if episode >1:
             torch.save({ 
-                'episode': episode,
-                'exploration_noise' : ddpg.exploration_noise,
-                'actor_state_dict': ddpg.actor.state_dict(),
-                'critic_state_dict': ddpg.critic.state_dict(),
-                'actor_optimizer': ddpg.actor_optimizer.state_dict(),
-                'critic_optimizer': ddpg.critic_optimizer.state_dict(),
-            }, f'ddpg_checkpoint_episode_{episode}.pth')
-            print(f"Saved checkpoint at episode {episode}")
+                    'episode': episode,
+                    'exploration_noise' : ddpg.exploration_noise,
+                    'actor_state_dict': ddpg.actor.state_dict(),
+                    'critic_state_dict': ddpg.critic.state_dict(),
+                    'actor_optimizer': ddpg.actor_optimizer.state_dict(),
+                    'critic_optimizer': ddpg.critic_optimizer.state_dict(),
+                }, f'ddpg_checkpoint_episode_{episode}.pth')
+        stop_training = False
 
 if __name__ == "__main__":
     # Uncomment to start training
-    # training_loop()
+    training_loop()
     print("DDPG implementation ready. Uncomment training_loop() to start training.")
     print("Make sure osu! and StreamCompanion are running before starting training.")
