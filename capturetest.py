@@ -115,6 +115,18 @@ def calculate_reward(prev_stats, current_stats):
     new_bads = current_stats['bads'] - prev_stats['bads']
     new_misses = current_stats['misses'] - prev_stats['misses']
 
+    if abs(new_perfects) > 5:
+        new_perfects=0
+    
+    if abs(new_goods) > 5:
+        new_goods=0
+
+    if abs(new_bads) > 5:
+        new_bads=0
+
+    if abs(new_misses) > 5:
+        new_misses=0
+
     reward += new_perfects * 10
     reward += new_goods * 5  
     reward += new_bads * 2
@@ -202,6 +214,9 @@ class Actor(nn.Module):
             nn.Linear(1024, action_space_size),
             nn.Tanh()  # Output action in range [-1, 1]
         )
+
+        nn.init.uniform_(self.fc[-2].weight,-0.1,0.1)
+        nn.init.uniform_(self.fc[-2].bias,-0.01,0.01)
     def forward(self,frame, mouse_pos):
         x= self.conv(frame)
         x = torch.flatten(x,1)
@@ -318,9 +333,12 @@ def training_loop():
     try:
         while not check_stop_condition():
             episode += 1
-            center_x = monitor["left"] + monitor["width"] // 2
-            center_y = monitor["top"] + monitor["height"] // 2
-            pyautogui.moveTo(center_x, center_y)
+            
+            random_x = monitor["left"] + random.randint(100,monitor["width"] - 100)
+            random_y = monitor["top"] + random.randint(100, monitor["height"] - 100)
+
+
+
             step = 0
             print(f"Starting Episode {episode}")
 
@@ -345,13 +363,15 @@ def training_loop():
                 penalty_threshold = 0.99
                 penalty=0
                 if any(abs(a) >= penalty_threshold for a in action_np):
-                    penalty = -100
+                    penalty = -1000
                 # print("Action output:", action_np)
 
-
-                new_x = monitor["left"] + (action_np[0] + 1) * monitor["width"] / 2
-                new_y = monitor["top"] + (action_np[1] + 1) * monitor["height"] / 2
-
+                current_x, current_y = pyautogui.position()
+                movement_scale = 30
+                new_x = np.clip(current_x + action_np[0] * movement_scale, 
+                               monitor["left"], monitor["left"] + monitor["width"])
+                new_y = np.clip(current_y + action_np[1] * movement_scale, 
+                               monitor["top"], monitor["top"] + monitor["height"])
                 pyautogui.moveTo(new_x, new_y, duration=0.04)
             
                 # below is the precise fps control  
@@ -412,7 +432,7 @@ def training_loop():
         stop_training = True
     finally:
         print('stopped and saved(probably)')
-        if episode >1:
+        if episode >5:
             torch.save({ 
                     'episode': episode,
                     'exploration_noise' : ddpg.exploration_noise,
